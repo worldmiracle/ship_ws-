@@ -123,7 +123,7 @@ def main():
     width = 500
     height = 500
     resolution = 1.0
-    output_dir = '/home/douhouqi/ship_ws/maps'
+    output_dir = os.path.expanduser('~/ship_ws/maps')
     print(f'\n生成地图: {width}m x {height}m, 分辨率 {resolution}m')
     grid = create_water_map(width, height, resolution)
     save_map(grid, output_dir)

@@ -12,7 +12,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, PoseArray
 import numpy as np
 import heapq
 import math
@@ -25,7 +25,8 @@ import time
 class AStarPlanner:
     """A* 路径规划算法实现"""
     
-    def __init__(self, grid: np.ndarray, resolution: float, origin_x: float, origin_y: float):
+    def __init__(self, grid: np.ndarray, resolution: float, origin_x: float, origin_y: float,
+                 verbose: bool = False):
         """
         初始化 A* 规划器
         
@@ -34,12 +35,14 @@ class AStarPlanner:
             resolution: 地图分辨率 (m/pixel)
             origin_x: 地图原点 X 坐标
             origin_y: 地图原点 Y 坐标
+            verbose: 是否输出详细调试信息
         """
         self.grid = grid
         self.resolution = resolution
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.height, self.width = grid.shape
+        self.verbose = verbose
         
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         """世界坐标转栅格坐标"""
@@ -97,19 +100,26 @@ class AStarPlanner:
         
         # 检查起点和终点是否有效
         if not self.is_valid(start_grid[0], start_grid[1]):
-            print(f"[警告] 起点无效: {start} -> 栅格 {start_grid}, 值: {self.grid[start_grid[1], start_grid[0]] if 0 <= start_grid[0] < self.width and 0 <= start_grid[1] < self.height else '超出范围'}")
+            if self.verbose:
+                print(f"[警告] 起点无效: {start} -> 栅格 {start_grid}")
             # 尝试找最近的有效点
             start_grid = self.find_nearest_valid(start_grid)
             if start_grid is None:
+                if self.verbose:
+                    print("[A*] 起点附近无可通行区域!")
                 return None
                 
         if not self.is_valid(goal_grid[0], goal_grid[1]):
-            print(f"[警告] 终点无效: {goal} -> 栅格 {goal_grid}, 值: {self.grid[goal_grid[1], goal_grid[0]] if 0 <= goal_grid[0] < self.width and 0 <= goal_grid[1] < self.height else '超出范围'}")
+            if self.verbose:
+                print(f"[警告] 终点无效: {goal} -> 栅格 {goal_grid}")
             goal_grid = self.find_nearest_valid(goal_grid)
             if goal_grid is None:
+                if self.verbose:
+                    print("[A*] 终点附近无可通行区域!")
                 return None
         
-        print(f"[A*] 起点栅格: {start_grid}, 终点栅格: {goal_grid}")
+        if self.verbose:
+            print(f"[A*] 起点栅格: {start_grid}, 终点栅格: {goal_grid}")
         
         # A* 算法
         open_set = []
@@ -159,7 +169,8 @@ class AStarPlanner:
                     f_score[neighbor] = f
                     heapq.heappush(open_set, (f, neighbor))
         
-        print(f"[A*] 未找到路径! 迭代次数: {iterations}")
+        if self.verbose:
+            print(f"[A*] 未找到路径! 迭代次数: {iterations}")
         return None
     
     def find_nearest_valid(self, grid_pos: Tuple[int, int], max_radius: int = 20) -> Optional[Tuple[int, int]]:
@@ -357,7 +368,7 @@ class AStarPlanner:
 
 
 class PathPlannerNode(Node):
-    """ROS 2 路径规划节点"""
+    """ROS 2 路径规划节点（支持动态避障重规划）"""
     
     def __init__(self):
         super().__init__('path_planner_node')
@@ -367,8 +378,15 @@ class PathPlannerNode(Node):
         self.declare_parameter('goal_topic', '/goal_pose')
         self.declare_parameter('start_topic', '/initialpose')
         self.declare_parameter('path_topic', '/planned_path')
-        self.declare_parameter('csv_output_path', '/home/douhouqi/ship_ws/planned_path.csv')
+        self.declare_parameter('csv_output_path', os.path.expanduser('~/ship_ws/planned_path.csv'))
         self.declare_parameter('smooth_path', True)
+        # 动态避障参数
+        self.declare_parameter('enable_dynamic_replanning', True)
+        self.declare_parameter('verbose_planner', False)  # A* 调试输出开关
+        self.declare_parameter('dynamic_obstacles_topic', '/dynamic_obstacles')
+        self.declare_parameter('ship_pose_topic', '/ship_pose')
+        self.declare_parameter('replan_check_interval', 2.0)   # 重规划检查间隔 (秒)
+        self.declare_parameter('replan_safety_distance', 8.0)  # 路径安全距离阈值 (米)
         
         # 获取参数
         self.map_topic = self.get_parameter('map_topic').value
@@ -377,15 +395,28 @@ class PathPlannerNode(Node):
         self.path_topic = self.get_parameter('path_topic').value
         self.csv_output_path = self.get_parameter('csv_output_path').value
         self.smooth_path_enabled = self.get_parameter('smooth_path').value
+        self.enable_dynamic_replanning = self.get_parameter('enable_dynamic_replanning').value
+        self.dynamic_obstacles_topic = self.get_parameter('dynamic_obstacles_topic').value
+        self.ship_pose_topic = self.get_parameter('ship_pose_topic').value
+        self.replan_check_interval = self.get_parameter('replan_check_interval').value
+        self.replan_safety_distance = self.get_parameter('replan_safety_distance').value
+        self.verbose_planner = self.get_parameter('verbose_planner').value
         
         # 地图数据
         self.map_data: Optional[OccupancyGrid] = None
         self.planner: Optional[AStarPlanner] = None
+        self.static_grid: Optional[np.ndarray] = None  # 静态地图的不可变拷贝
         self.map_initialized = False
         
         # 起点和终点
         self.start_pose: Optional[Tuple[float, float]] = None
         self.goal_pose: Optional[Tuple[float, float]] = None
+        
+        # 船舶当前位置（用于重规划起点）
+        self.ship_current_pose: Optional[Tuple[float, float]] = None
+        
+        # 当前路径缓存（用于碰撞检测）
+        self.current_path: Optional[List[Tuple[float, float]]] = None
         
         # 订阅者
         self.map_sub = self.create_subscription(
@@ -411,6 +442,22 @@ class PathPlannerNode(Node):
             10
         )
         
+        # 订阅动态障碍物
+        self.obstacles_sub = self.create_subscription(
+            PoseArray,
+            self.dynamic_obstacles_topic,
+            self.dynamic_obstacles_callback,
+            10
+        )
+        
+        # 订阅船舶当前位置（用于重规划）
+        self.ship_pose_sub = self.create_subscription(
+            PoseStamped,
+            self.ship_pose_topic,
+            self.ship_pose_callback,
+            10
+        )
+        
         # 发布者
         self.path_pub = self.create_publisher(
             Path,
@@ -431,8 +478,16 @@ class PathPlannerNode(Node):
             10
         )
         
+        # 重规划检查定时器
+        self.replan_timer = self.create_timer(
+            self.replan_check_interval,
+            self.replan_check_callback
+        )
+        
         self.get_logger().info('=' * 50)
         self.get_logger().info('船舶路径规划节点已启动!')
+        self.get_logger().info(f'  动态避障重规划: {"启用" if self.enable_dynamic_replanning else "禁用"}')
+        self.get_logger().info(f'  重规划检查间隔: {self.replan_check_interval}s')
         self.get_logger().info('=' * 50)
         self.get_logger().info('使用说明:')
         self.get_logger().info('1. 等待地图加载...')
@@ -440,6 +495,7 @@ class PathPlannerNode(Node):
         self.get_logger().info('   - 点击 "2D Pose Estimate" 设置起点')
         self.get_logger().info('   - 点击 "Nav2 Goal" 设置终点')
         self.get_logger().info('3. 路径将自动规划并发布到 /planned_path')
+        self.get_logger().info('4. 遇到动态障碍物时自动重规划!')
         self.get_logger().info('=' * 50)
     
     def map_callback(self, msg: OccupancyGrid):
@@ -455,12 +511,16 @@ class PathPlannerNode(Node):
         height = msg.info.height
         grid = np.array(msg.data, dtype=np.int8).reshape((height, width))
         
+        # 保存静态地图拷贝（用于动态障碍物叠加时恢复）
+        self.static_grid = grid.copy()
+        
         # 创建规划器
         self.planner = AStarPlanner(
             grid=grid,
             resolution=msg.info.resolution,
             origin_x=msg.info.origin.position.x,
-            origin_y=msg.info.origin.position.y
+            origin_y=msg.info.origin.position.y,
+            verbose=self.verbose_planner
         )
         self.map_initialized = True
         
@@ -503,25 +563,35 @@ class PathPlannerNode(Node):
         if self.map_data and self.start_pose:
             self.plan_path()
     
-    def plan_path(self):
-        """执行路径规划"""
+    def plan_path(self, start_override: Optional[Tuple[float, float]] = None):
+        """执行路径规划
+        
+        Args:
+            start_override: 可选的重规划起点，用于动态避障
+        """
         if not self.planner:
             self.get_logger().warn('地图未加载，无法规划路径!')
             return
         
-        if not self.start_pose or not self.goal_pose:
+        start = start_override if start_override else self.start_pose
+        goal = self.goal_pose
+        
+        if not start or not goal:
             self.get_logger().warn('起点或终点未设置!')
             return
         
+        is_replan = start_override is not None
+        tag = '[重规划]' if is_replan else ''
+        
         self.get_logger().info('=' * 40)
-        self.get_logger().info(f'开始路径规划...')
-        self.get_logger().info(f'起点: {self.start_pose}')
-        self.get_logger().info(f'终点: {self.goal_pose}')
+        self.get_logger().info(f'{tag} 开始路径规划...')
+        self.get_logger().info(f'起点: {start}')
+        self.get_logger().info(f'终点: {goal}')
         
         start_time = time.time()
         
         # A* 路径规划
-        path = self.planner.plan(self.start_pose, self.goal_pose)
+        path = self.planner.plan(start, goal)
         
         if path is None:
             self.get_logger().error('无法找到可行路径!')
@@ -551,6 +621,9 @@ class PathPlannerNode(Node):
         # 发布路径
         self.publish_path(path)
         
+        # 缓存当前路径（用于动态避障检测）
+        self.current_path = path
+        
         # 保存为 CSV
         self.save_path_csv(path)
     
@@ -576,7 +649,9 @@ class PathPlannerNode(Node):
     def save_path_csv(self, path: List[Tuple[float, float]]):
         """保存路径到 CSV 文件"""
         try:
-            with open(self.csv_output_path, 'w', newline='') as f:
+            output_path = os.path.expanduser(self.csv_output_path)
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            with open(output_path, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['x', 'y'])
                 for x, y in path:
@@ -584,6 +659,133 @@ class PathPlannerNode(Node):
             self.get_logger().info(f'路径已保存到: {self.csv_output_path}')
         except Exception as e:
             self.get_logger().error(f'保存 CSV 失败: {e}')
+    
+    # ==================== 动态避障相关方法 ====================
+    
+    def ship_pose_callback(self, msg: PoseStamped):
+        """跟踪船舶当前位置"""
+        self.ship_current_pose = (msg.pose.position.x, msg.pose.position.y)
+    
+    def dynamic_obstacles_callback(self, msg: PoseArray):
+        """
+        接收动态障碍物列表，更新地图并检查路径安全
+        """
+        if not self.enable_dynamic_replanning:
+            return
+        if not self.planner or self.static_grid is None:
+            return
+        
+        # 将动态障碍物叠加到规划器地图上
+        self.apply_dynamic_obstacles(msg)
+        
+        self.get_logger().debug(
+            f'收到 {len(msg.poses)} 个动态障碍物，已更新地图'
+        )
+    
+    def apply_dynamic_obstacles(self, msg: PoseArray):
+        """
+        在静态地图上叠加动态障碍物
+        先恢复静态地图，再逐个标记障碍物栅格
+        """
+        # 恢复为静态地图
+        self.planner.grid = self.static_grid.copy()
+        
+        # 叠加每个动态障碍物
+        for pose in msg.poses:
+            obs_x = pose.position.x
+            obs_y = pose.position.y
+            # orientation.w 存储障碍物半径
+            radius = pose.orientation.w if pose.orientation.w > 0 else 10.0
+            
+            # 转换为栅格坐标
+            cx, cy = self.planner.world_to_grid(obs_x, obs_y)
+            radius_cells = int(radius / self.planner.resolution) + 1
+            
+            # 标记障碍物区域
+            for dx in range(-radius_cells, radius_cells + 1):
+                for dy in range(-radius_cells, radius_cells + 1):
+                    gx, gy = cx + dx, cy + dy
+                    if 0 <= gx < self.planner.width and 0 <= gy < self.planner.height:
+                        # 圆形区域
+                        if dx * dx + dy * dy <= radius_cells * radius_cells:
+                            self.planner.grid[gy, gx] = 100
+    
+    def check_path_blocked(self) -> bool:
+        """
+        检查当前路径是否被障碍物阻断
+        遍历路径上每个点，检查距离最近的障碍物栅格
+        
+        Returns:
+            True 如果路径被阻断需要重规划
+        """
+        if not self.current_path or not self.planner:
+            return False
+        
+        # 路径太短（已到达终点），无需检测
+        if len(self.current_path) < 2:
+            return False
+        
+        safety_cells = int(self.replan_safety_distance / self.planner.resolution)
+        
+        for wx, wy in self.current_path:
+            gx, gy = self.planner.world_to_grid(wx, wy)
+            # 检查路径点周围是否有障碍物
+            for dx in range(-safety_cells, safety_cells + 1):
+                for dy in range(-safety_cells, safety_cells + 1):
+                    nx, ny = gx + dx, gy + dy
+                    if 0 <= nx < self.planner.width and 0 <= ny < self.planner.height:
+                        if self.planner.grid[ny, nx] == 100:
+                            # 计算实际距离
+                            obs_wx, obs_wy = self.planner.grid_to_world(nx, ny)
+                            dist = math.hypot(wx - obs_wx, wy - obs_wy)
+                            if dist < self.replan_safety_distance:
+                                return True
+        return False
+    
+    def replan_check_callback(self):
+        """
+        定时器回调：检查路径是否被动态障碍物阻断，触发重规划
+        """
+        if not self.enable_dynamic_replanning:
+            return
+        if not self.planner or not self.current_path:
+            return
+        if not self.goal_pose:
+            return
+        
+        # 检查船舶是否已到达终点附近（< 5m），若是则停止重规划
+        if self.ship_current_pose and self.goal_pose:
+            dist_to_goal = math.hypot(
+                self.ship_current_pose[0] - self.goal_pose[0],
+                self.ship_current_pose[1] - self.goal_pose[1]
+            )
+            if dist_to_goal < 5.0 and len(self.current_path) <= 2:
+                # 已到达，不触发重规划
+                return
+        
+        # 检查路径是否被阻断
+        if self.check_path_blocked():
+            self.get_logger().warn('⚠️  检测到路径被动态障碍物阻断，触发重规划!')
+            
+            # 使用船舶当前位置作为新起点
+            if self.ship_current_pose:
+                # 安全检查：起点和终点距离太近则跳过
+                dist = math.hypot(
+                    self.ship_current_pose[0] - self.goal_pose[0],
+                    self.ship_current_pose[1] - self.goal_pose[1]
+                )
+                if dist < 3.0:
+                    self.get_logger().info('🏁 船舶已到达终点附近，跳过重规划')
+                    return
+                    
+                self.get_logger().info(
+                    f'使用船舶当前位置作为起点: '
+                    f'({self.ship_current_pose[0]:.1f}, {self.ship_current_pose[1]:.1f})'
+                )
+                self.plan_path(start_override=self.ship_current_pose)
+            else:
+                # 没有船舶位置信息，保持当前路径
+                self.get_logger().warn('无法获取船舶当前位置，跳过重规划')
 
 
 def main(args=None):
@@ -596,7 +798,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':

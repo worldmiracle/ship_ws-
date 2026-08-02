@@ -23,8 +23,11 @@ except ImportError:
 
 class SimpleMapServer(Node):
     def __init__(self):
-        super().__init__("map_server", automatically_declare_parameters_from_overrides=True)
-        self.yaml_filename = self.get_parameter("yaml_filename").value
+        super().__init__("map_server")
+
+        # Declare parameters manually for maximum compatibility
+        self.declare_parameter('yaml_filename', '')
+        self.yaml_filename = self.get_parameter('yaml_filename').value
         if not self.yaml_filename:
             self.get_logger().error("yaml_filename parameter is required!")
             raise RuntimeError("yaml_filename parameter is required")
@@ -101,7 +104,7 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

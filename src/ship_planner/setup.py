@@ -19,7 +19,7 @@ setup(
         (os.path.join('share', package_name, 'config'),
             glob('config/*.rviz')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'numpy', 'Pillow', 'PyYAML', 'matplotlib'],
     zip_safe=True,
     maintainer='douhouqi',
     maintainer_email='douhouqi@todo.todo',
@@ -35,6 +35,8 @@ setup(
             'path_planner = ship_planner.path_planner_node:main',
             'map_generator = ship_planner.map_generator:main',
             'simple_map_server = ship_planner.simple_map_server:main',
+            'ship_simulator = ship_planner.ship_simulator:main',
+            'obstacle_detector = ship_planner.obstacle_detector:main',
         ],
     },
 )
